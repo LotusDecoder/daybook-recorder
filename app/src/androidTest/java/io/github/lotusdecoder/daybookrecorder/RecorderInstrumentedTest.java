@@ -29,6 +29,7 @@ import org.junit.runner.RunWith;
 import org.junit.runners.MethodSorters;
 import static org.junit.Assert.*;
 import io.github.lotusdecoder.daybookrecorder.core.OggOpus;
+import io.github.lotusdecoder.daybookrecorder.core.LiveBackfill;
 import io.github.lotusdecoder.daybookrecorder.core.Protocol;
 import io.github.lotusdecoder.daybookrecorder.core.RecordingAssembler;
 import io.github.lotusdecoder.daybookrecorder.core.RecordingSizeUnit;
@@ -1149,6 +1150,167 @@ public class RecorderInstrumentedTest {
         } finally {
             HttpsURLConnection.setDefaultSSLSocketFactory(original);
         }
+    }
+    /** Exercises complete, interrupted and weak-signal recordings with generated frames. */
+    @Test public void liveStreamBackfillsOnlyMissingFramesSealsEarlyAndKeepsHighlights() throws Exception {
+        String addr="02:00:00:00:00:07",dev=RecordingStore.deviceId(addr);
+        long liveId=1700003100L,lossId=1700003200L,weakSignalId=1700003300L;
+        byte[][] raw120=frames(120,8),raw200=frames(200,7),raw50=frames(50,9);
+        String sha120=muxHash(raw120,liveId,2400L),sha200=muxHash(raw200,lossId,4000L),shaWeak=muxHash(raw50,weakSignalId,1000L);
+
+        DeviceCrypto phone=new DeviceCrypto(),peer=new DeviceCrypto();byte[] secret=peer.shared(phone.publicKey());
+        phone.handshake(ByteBuffer.allocate(97).put(peer.publicKey()).put(secret).array());
+        byte[] salt={1,2,3},key=new byte[32],nonce=new byte[16];Arrays.fill(key,(byte)13);
+        byte[] wrapped=DeviceCrypto.ctr(ByteBuffer.allocate(46).put("soundcored3200".getBytes(StandardCharsets.US_ASCII)).put(key).array(),
+                DeviceCrypto.hkdf(secret,salt,salt),nonce);
+        DeviceCrypto.FileKey fk=phone.fileKey(head(liveId,0xffffffffL,nonce,wrapped),liveId);
+        DeviceCrypto.FileKey fkLoss=phone.fileKey(head(lossId,0xffffffffL,nonce,wrapped),lossId);
+        DeviceCrypto.FileKey fkWeak=phone.fileKey(head(weakSignalId,50*166,nonce,wrapped),weakSignalId);
+
+        SSLSocketFactory original=useFixtureTls();
+        try {
+            endpoint("/v1/recordings");
+            Settings.prefs(context).edit().putBoolean("sync_on_connect",true).putBoolean("auto_cleanup",false).commit();
+            openSession();
+            waitFor(()->running() && onRecordingThread(()->recordingOwner()!=null && (boolean)field(recordingOwner(),"started")));
+            RecorderService service=onRecordingThread(()->{
+                RecorderService owner=recordingOwner();
+                ((Handler)field(owner,"worker")).removeCallbacks((Runnable)field(owner,"ticker"));
+                java.lang.reflect.Method close=RecorderService.class.getDeclaredMethod("closeGatt");close.setAccessible(true);close.invoke(owner);
+                setField(owner,"device",dev);setField(owner,"firmware","04.00");setField(owner,"ready",true);
+                setField(owner,"crypto",phone);setField(owner,"deviceReportedIdle",true);
+                ((ConnectionSync)field(owner,"connectionSync")).connected();
+                return owner;
+            });
+
+            // Case 1: live stream starts at seq 8 (head never streamed), double-click flag 1 at seq 60, last slice flag 4,
+            // then 1A/0A carries the duration. Only the head is fetched and the recording is sealed before the rest arrives.
+            RuntimeTelemetry.rssiDbm=-60;
+            notifyBean(service,0x1a,6,ByteBuffer.allocate(9).order(ByteOrder.LITTLE_ENDIAN).putInt((int)liveId).array());
+            notifyBean(service,0x18,0x82,new byte[]{1});
+            waitFor(()->onRecordingThread(()->{Object act=field(service,"active");return act!=null && (long)field(act,"fileId")==liveId && (boolean)field(act,"live");}));
+            notifyBean(service,0x1a,7,head(liveId,0xffffffffL,nonce,wrapped));
+            for(int i=8;i<70;i++)notifyBean(service,0x1a,8,slice(fk,raw120,i,i==60?1:0));
+            // A 1A/07 repeated mid-transfer is acknowledged with a header that does not verify; the stream keeps its key.
+            byte[] badHead=head(liveId,0xffffffffL,nonce,wrapped);badHead[30]^=1;
+            notifyBean(service,0x1a,7,badHead);
+            assertTrue(onRecordingThread(()->{Object act=field(service,"active");return act!=null && (boolean)field(act,"live") && field(act,"key")!=null;}));
+            for(int i=70;i<120;i++)notifyBean(service,0x1a,8,slice(fk,raw120,i,i==119?4:0));
+            assertEquals(2400L,(long)onRecordingThread(()->LiveBackfill.receivedDurationMs((RecordingAssembler)field(field(service,"active"),"assembler"))));
+            long stopAt=SystemClock.elapsedRealtime();
+            notifyBean(service,0x18,0x82,new byte[]{0});
+            // The live end notification already carries the duration, so no list read is needed before backfilling.
+            notifyBean(service,0x1a,0x0a,end(2400,liveId));
+            waitFor(()->onRecordingThread(()->{Object act=field(service,"active");
+                return act!=null && (boolean)field(act,"backfill") && field(act,"backfillPhase")==LiveBackfill.Phase.HEAD && (long)field(act,"resumedOffset")==0L;}));
+            notifyBean(service,0x1a,7,head(liveId,120*166,nonce,wrapped));
+            for(int i=0;i<8;i++)notifyBean(service,0x1a,8,slice(fk,raw120,i,i==0?2:0));
+            String rec=RecordingStore.id(dev,liveId);
+            waitFor(()->store.get(rec).state.equals("SENT"));
+            assertTrue("head backfill took too long",SystemClock.elapsedRealtime()-stopAt<5000L);
+            assertEquals(sha120,store.get(rec).sha);assertEquals(2400L,store.get(rec).duration);
+            assertEquals(Collections.singletonList(1200L),store.highlights(rec));
+            assertEquals(liveId,(long)onRecordingThread(()->field(service,"drainFileId")));
+            assertNull(onRecordingThread(()->field(service,"active")));
+            for(int i=8;i<120;i++)notifyBean(service,0x1a,8,slice(fk,raw120,i,i==60?1:i==119?4:0));
+            assertEquals(sha120,store.get(rec).sha);
+            notifyBean(service,0x1a,0x0a,end(2400,liveId));
+            waitFor(()->onRecordingThread(()->(long)field(service,"drainFileId")==0L));
+            assertTrue(EventLog.tail(context).contains("实时录音补齐后保存 "+liveId));
+
+            // Case 2: link lost after seq 99 while still recording. Live frames are kept; after reconnecting the live
+            // stream resumes at the current position, then the gap is fetched by offset first and the head last.
+            notifyBean(service,0x1a,6,ByteBuffer.allocate(9).order(ByteOrder.LITTLE_ENDIAN).putInt((int)lossId).array());
+            notifyBean(service,0x18,0x82,new byte[]{1});
+            waitFor(()->onRecordingThread(()->{Object act=field(service,"active");return act!=null && (long)field(act,"fileId")==lossId && (boolean)field(act,"live");}));
+            notifyBean(service,0x1a,7,head(lossId,0xffffffffL,nonce,wrapped));
+            for(int i=12;i<100;i++)notifyBean(service,0x1a,8,slice(fkLoss,raw200,i,i==50?1:0));
+            onRecordingThread(()->{
+                java.lang.reflect.Method d=RecorderService.class.getDeclaredMethod("disconnect",String.class,boolean.class);d.setAccessible(true);d.invoke(service,"测试断线",false);
+                return null;
+            });
+            assertNull(onRecordingThread(()->field(service,"active")));
+            assertEquals(88,(int)onRecordingThread(()->((RecordingAssembler)field(field(service,"parked"),"assembler")).frames()));
+            String recLoss=RecordingStore.id(dev,lossId);
+            assertEquals("WAITING",store.get(recLoss).state);
+            onRecordingThread(()->{
+                setField(service,"ready",true);setField(service,"crypto",phone);setField(service,"recording",true);setField(service,"currentId",lossId);
+                RuntimeTelemetry.rssiDbm=-60;
+                java.lang.reflect.Method live=RecorderService.class.getDeclaredMethod("startOrDeferLiveFile",long.class);live.setAccessible(true);live.invoke(service,lossId);
+                return null;
+            });
+            waitFor(()->onRecordingThread(()->{Object act=field(service,"active");return act!=null && (long)field(act,"fileId")==lossId && (boolean)field(act,"live");}));
+            assertNull(onRecordingThread(()->field(service,"parked")));
+            notifyBean(service,0x1a,7,head(lossId,0xffffffffL,nonce,wrapped));
+            for(int i=150;i<200;i++)notifyBean(service,0x1a,8,slice(fkLoss,raw200,i,i==199?4:0));
+            notifyBean(service,0x18,0x82,new byte[]{0});
+            // The live end notification already carries the duration, so no list read is needed before backfilling.
+            notifyBean(service,0x1a,0x0a,end(4000,lossId));
+            waitFor(()->onRecordingThread(()->{Object act=field(service,"active");
+                return act!=null && (boolean)field(act,"backfill") && field(act,"backfillPhase")==LiveBackfill.Phase.TAIL && (long)field(act,"resumedOffset")==100L*166;}));
+            notifyBean(service,0x1a,7,head(lossId,200*166,nonce,wrapped));
+            for(int i=100;i<200;i++)notifyBean(service,0x1a,8,slice(fkLoss,raw200,i,i==199?4:0));
+            notifyBean(service,0x1a,0x0a,end(4000,lossId));
+            waitFor(()->onRecordingThread(()->{Object act=field(service,"active");
+                return act!=null && field(act,"backfillPhase")==LiveBackfill.Phase.HEAD && (long)field(act,"resumedOffset")==0L;}));
+            notifyBean(service,0x1a,7,head(lossId,200*166,nonce,wrapped));
+            for(int i=0;i<12;i++)notifyBean(service,0x1a,8,slice(fkLoss,raw200,i,i==0?2:0));
+            waitFor(()->store.get(recLoss).state.equals("SENT"));
+            assertEquals(sha200,store.get(recLoss).sha);assertEquals(4000L,store.get(recLoss).duration);
+            assertEquals(Collections.singletonList(1000L),store.highlights(recLoss));
+            notifyBean(service,0x1a,0x0a,end(4000,lossId));
+            waitFor(()->onRecordingThread(()->(long)field(service,"drainFileId")==0L));
+
+            // Case 3: Weak BLE signal (-93 dBm) when button pressed -> skips live streaming so bean records locally,
+            //         then pulls cleanly offline once recording finishes!
+            RuntimeTelemetry.rssiDbm=-93;
+            notifyBean(service,0x1a,6,ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt((int)weakSignalId).array());
+            notifyBean(service,0x18,0x82,new byte[]{1});
+            String recWeak=RecordingStore.id(dev,weakSignalId);
+            waitFor(()->RuntimeTelemetry.liveDeferredWeakSignal && store.get(recWeak)!=null);
+            assertNull(onRecordingThread(()->field(service,"active")));
+            assertEquals("WAITING",store.get(recWeak).state);
+
+            RuntimeTelemetry.rssiDbm=-65;
+            notifyBean(service,0x18,0x82,new byte[]{0});
+            waitFor(()->onRecordingThread(()->(boolean)field(service,"listing")));
+            byte[] listWeak=ByteBuffer.allocate(2+12).order(ByteOrder.LITTLE_ENDIAN).putShort((short)1)
+                    .putInt((int)weakSignalId).putInt((int)weakSignalId+2).putInt(1000).array();
+            notifyBean(service,0x1b,0x0e,listWeak);
+
+            waitFor(()->onRecordingThread(()->{
+                Object act=field(service,"active");
+                return act!=null && (long)field(act,"fileId")==weakSignalId && !(boolean)field(act,"live");
+            }));
+            notifyBean(service,0x1a,7,head(weakSignalId,50*166,nonce,wrapped));
+            for(int i=0;i<50;i++)notifyBean(service,0x1a,8,slice(fkWeak,raw50,i,0));
+            notifyBean(service,0x1a,0x0a,end(1000,weakSignalId));
+
+            waitFor(()->store.get(recWeak).state.equals("SENT"));
+            assertEquals(shaWeak,store.get(recWeak).sha);
+        } finally {
+            HttpsURLConnection.setDefaultSSLSocketFactory(original);
+        }
+    }
+    private static byte[][] frames(int n,int fill) {
+        byte[][] raw=new byte[n][160];
+        for(int i=0;i<n;i++){Arrays.fill(raw[i],(byte)fill);raw[i][0]=(byte)0xbc;raw[i][158]=(byte)(i>>8);raw[i][159]=(byte)i;}
+        return raw;
+    }
+    private String muxHash(byte[][] raw,long id,long expectedMs) throws Exception {
+        File f=new File(context.getCacheDir(),"mux-"+id+".raw"),o=new File(context.getCacheDir(),"mux-"+id+".ogg");
+        try(FileOutputStream out=new FileOutputStream(f)){for(byte[] b:raw)out.write(b);}
+        assertEquals(expectedMs,OggOpus.mux(f,o,(int)id));
+        String sha=RecordingStore.hash(o);f.delete();o.delete();return sha;
+    }
+    private static byte[] head(long id,long size,byte[] nonce,byte[] wrapped) {
+        return ByteBuffer.allocate(87).order(ByteOrder.LITTLE_ENDIAN).putInt((int)id).putInt((int)size).put(nonce).put(wrapped).put(nonce).put((byte)0).array();
+    }
+    private static byte[] slice(DeviceCrypto.FileKey key,byte[][] raw,int seq,int flag) throws Exception {
+        return ByteBuffer.allocate(166).order(ByteOrder.LITTLE_ENDIAN).putInt(seq).put((byte)flag).put(key.decrypt(seq,raw[seq])).put((byte)0).array();
+    }
+    private static byte[] end(long ms,long id) {
+        return ByteBuffer.allocate(9).order(ByteOrder.LITTLE_ENDIAN).put((byte)0).putInt((int)ms).putInt((int)id).array();
     }
     private void runManualCleanup(boolean changed) throws Exception {
         openSession();waitFor(this::running);

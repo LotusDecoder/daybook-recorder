@@ -11,6 +11,7 @@ import java.security.*;
 import java.util.*;
 import io.github.lotusdecoder.daybookrecorder.core.Protocol;
 import io.github.lotusdecoder.daybookrecorder.core.OggOpus;
+import io.github.lotusdecoder.daybookrecorder.core.LiveBackfill;
 
 final class RecordingStore extends SQLiteOpenHelper {
     private static final Object DELETE_LOCK=new Object();
@@ -114,10 +115,16 @@ final class RecordingStore extends SQLiteOpenHelper {
     }
     synchronized void progress(String id,long bytes) {ContentValues v=new ContentValues();v.put("bytes",bytes);update(id,v);}
     long saveReceived(String id,long fileId,File source,int frames,boolean matchedReadback) throws IOException {
+        return saveReceived(id,fileId,source,frames,matchedReadback,0L);
+    }
+    long saveReceived(String id,long fileId,File source,int frames,boolean matchedReadback,long requiredDurationMs) throws IOException {
         File temp=file(id,".ogg.tmp");
         long duration=OggOpus.mux(source,temp,(int)fileId);
-        if(matchedReadback && duration!=frames*(long)OfflineReadback.FRAME_MILLIS)
+        if((matchedReadback && duration!=frames*(long)OfflineReadback.FRAME_MILLIS)
+                || (requiredDurationMs>0L && duration!=requiredDurationMs)) {
+            temp.delete();
             throw new IOException("Opus 时长与分片数不符");
+        }
         String sha=hash(temp);
         Files.move(source.toPath(),file(id,".opus.bin").toPath(),StandardCopyOption.REPLACE_EXISTING,StandardCopyOption.ATOMIC_MOVE);
         Files.move(temp.toPath(),file(id,".ogg").toPath(),StandardCopyOption.REPLACE_EXISTING,StandardCopyOption.ATOMIC_MOVE);
@@ -127,6 +134,18 @@ final class RecordingStore extends SQLiteOpenHelper {
         ready(id,frames*160L,duration,sha,matchedReadback);
         if(matchedReadback)file(id,".readback-first").delete(); // Now redundant with the committed raw audio.
         return duration;
+    }
+    /** Double-click highlight positions (ms) found in slice flags, kept beside the audio. */
+    void saveHighlights(String id,List<Long> millis) throws IOException {
+        File target=file(id,".marks"),temp=file(id,".marks.tmp");
+        Files.write(temp.toPath(),LiveBackfill.encodeHighlights(millis).getBytes(StandardCharsets.US_ASCII));
+        Files.move(temp.toPath(),target.toPath(),StandardCopyOption.REPLACE_EXISTING,StandardCopyOption.ATOMIC_MOVE);
+    }
+    List<Long> highlights(String id) {
+        File f=file(id,".marks");
+        if(!f.isFile())return new ArrayList<>();
+        try{return LiveBackfill.decodeHighlights(new String(Files.readAllBytes(f.toPath()),StandardCharsets.US_ASCII));}
+        catch(IOException e){return new ArrayList<>();}
     }
     synchronized void ready(String id,long bytes,long duration,String sha) {
         ready(id,bytes,duration,sha,false);
@@ -331,7 +350,7 @@ final class RecordingStore extends SQLiteOpenHelper {
         }
     }
     private void purgeLocal(String id) throws IOException {
-        for(String suffix:new String[]{".ogg",".opus.bin",".part",".part.resume",".part.resume.tmp",".part.attempts",".ogg.tmp",".readback",".readback-first",".readback-original"})Files.deleteIfExists(file(id,suffix).toPath());
+        for(String suffix:new String[]{".ogg",".opus.bin",".part",".part.resume",".part.resume.tmp",".part.attempts",".ogg.tmp",".readback",".readback-first",".readback-original",".marks",".marks.tmp"})Files.deleteIfExists(file(id,suffix).toPath());
         try {
             FileDescriptor directory=android.system.Os.open(root.getAbsolutePath(),android.system.OsConstants.O_RDONLY,0);
             try{android.system.Os.fsync(directory);}finally{android.system.Os.close(directory);}

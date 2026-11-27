@@ -24,6 +24,7 @@ public final class RecorderService extends Service {
             SWITCH_DEVICE="io.github.lotusdecoder.daybookrecorder.SWITCH_DEVICE";
     private static final String CHANNEL="recording_connection";
     private static final int NOTIFICATION=3201;
+    private static final long LIVE_FALLBACK_QUIET_MILLIS=650L;
     private Handler worker;
     private RecordingStore store;
     private DeviceFilesStore deviceFiles;
@@ -39,6 +40,7 @@ public final class RecorderService extends Service {
     private final InventoryPages inventoryPages=new InventoryPages();
     private final Map<Long,Long> cooldown=new HashMap<>();
     private final Set<Long> forceZeroOffset=new HashSet<>();
+    private final Set<Long> liveDegradedMidStream=new HashSet<>();
     private PowerManager.WakeLock wake;
     private ConnectivityManager connectivity;
     private long generation,writeSerial,nextReconnect,lastHeartbeat,lastInfo,lastProgress,lastRx,wakeRenewed;
@@ -55,6 +57,11 @@ public final class RecorderService extends Service {
     private String fallbackCandidateAddr="",fallbackCandidateAdvHash="",fallbackCandidateName="";
     private int fallbackCandidateCount;
     private Active active;
+    /** Live frames kept in memory across a link loss so a reconnect only fetches what is missing. */
+    private Active parked;
+    /** After an early seal the bean keeps streaming the rest of that file; no new 1A/07 until it ends. */
+    private long drainFileId,drainLastData;
+    private boolean localDeletionStop;
     private Cleanup cleanup;
     private long cleanupQuarantinedGeneration=-1,listActiveId;
     private static final class Cleanup {
@@ -138,7 +145,7 @@ public final class RecorderService extends Service {
             if(BIND.equals(action) && ready) {cancelCleanup("设备正在重新绑定，清理结果待检查");send(Protocol.command(0x0b,0x87,(byte)1));setStatus("已申请设备绑定；如录音豆提示，请按实体键确认");}
             if(SWITCH_DEVICE.equals(action)) {
                 stopBgScan();cancelCleanup("切换录音豆，暂停清理核对");closeGatt();abandon("切换设备，稍后补收");
-                reconnects=0;lastBgScanAt=0;fallbackSelectedAddress="";unverifiedFallbackAddress=false;nextReconnect=0;forceZeroOffset.clear();
+                reconnects=0;lastBgScanAt=0;fallbackSelectedAddress="";unverifiedFallbackAddress=false;nextReconnect=0;forceZeroOffset.clear();liveDegradedMidStream.clear();
                 worker.postDelayed(this::connect,450);
             }
             if(REFRESH.equals(action)) {
@@ -154,7 +161,7 @@ public final class RecorderService extends Service {
             }
             if(RETRY.equals(action)) {
                 store.retryUploads();store.retryDownloads();store.resetRetryableCleanups(device);
-                cooldown.clear();forceZeroOffset.clear();uploads.kick();
+                cooldown.clear();forceZeroOffset.clear();liveDegradedMidStream.clear();uploads.kick();
                 if(ready){requestInventory();advancePipeline();}
             }
             if(CLEANUP_CHANGED.equals(action) || SYNC_CHANGED.equals(action)) {
@@ -179,7 +186,7 @@ public final class RecorderService extends Service {
         try {connectivity.unregisterNetworkCallback(network);}catch(RuntimeException ignored) { }
         uploads.close();
         worker.post(()->{
-            closed=true;started=false;stopBgScan();worker.removeCallbacksAndMessages(null);cancelCleanup("后台服务已停止");closeGatt();abandon("接收暂停，重新开启后补收");
+            closed=true;started=false;stopBgScan();worker.removeCallbacksAndMessages(null);cancelCleanup("后台服务已停止");closeGatt();abandon("接收暂停，重新开启后补收");dropParked("后台服务停止，暂存的实时分片改为稍后完整补收");
             if(wake.isHeld())wake.release();
             long wallNow=System.currentTimeMillis();
             android.content.SharedPreferences.Editor stopEdit=Settings.prefs(this).edit().putLong("heartbeat",0).putString("status","后台服务已停止");
@@ -223,6 +230,17 @@ public final class RecorderService extends Service {
             abortInventory("豆内列表读取超时；保留上次成功读取的列表");
             if(listType==0x1b) {listType=0x1a;requestInventory();}
             else problem("录音列表无响应；固件可能不兼容，可尝试设备绑定");
+        }
+        if(recording && crypto!=null && crypto.ready())safeReadRssi();
+        if(recording && !paused && active==null && currentId>0 && RuntimeTelemetry.liveDeferredWeakSignal
+                && !liveDegradedMidStream.contains(currentId)
+                && ConnectionHud.canRecoverDeferredLive(RuntimeTelemetry.rssiDbm)) {
+            EventLog.add(this,"蓝牙信号已恢复稳定（"+RuntimeTelemetry.rssiDbm+" dBm），切入实时接收 "+currentId);
+            startOrDeferLiveFile(currentId);
+        }
+        if(active!=null && active.live && recording && !paused && now-active.lastData>15000) {
+            degradeLiveToBean(active,"实时流响应变慢，已暂存实时分片，结束后只补缺失部分");
+            return;
         }
         if(active!=null && !paused && now-active.lastData>45000) {disconnect("录音接收超时，重新连接后补收",true);return;}
         if(active==null && now-lastRx>215000) {disconnect("设备长时间无响应，正在自动重连",true);return;}
@@ -382,10 +400,11 @@ public final class RecorderService extends Service {
         }
         fallbackSelectedAddress="";unverifiedFallbackAddress=false;
         RuntimeTelemetry.connectedSinceWallMs=0L;RuntimeTelemetry.rssiDbm=Integer.MIN_VALUE;
-        RuntimeTelemetry.bleTransfer=null;RuntimeTelemetry.beanRecording=false;RuntimeTelemetry.beanPaused=false;
+        RuntimeTelemetry.bleTransfer=null;RuntimeTelemetry.beanRecording=false;RuntimeTelemetry.beanPaused=false;RuntimeTelemetry.liveDeferredWeakSignal=false;
         RuntimeTelemetry.cleaningRecordingId="";RuntimeTelemetry.cleaningFileId=0L;
+        liveDegradedMidStream.clear();
         cancelCleanup("蓝牙连接中断，清理结果待检查");
-        closeGatt();abandon("连接中断，等待补收");recording=false;paused=false;currentId=0;listing=false;
+        if(!localDeletionStop)parkTransfer("连接中断");closeGatt();abandon("连接中断，等待补收");recording=false;paused=false;currentId=0;listing=false;
         if(backoff)reconnects++;
         long delay=reconnects<=1?2000L:reconnects==2?3500L:Math.min(35000L,4000L*(1L<<Math.min(4,reconnects-2)));
         nextReconnect=SystemClock.elapsedRealtime()+delay;
@@ -398,17 +417,20 @@ public final class RecorderService extends Service {
         if(requestedDownload>0 && RecordingStore.id(device,requestedDownload).equals(id)) {
             requestedDownload=0;requestedRestore=false;
         }
+        if(parked!=null && parked.id.equals(id)) {Active p=parked;parked=null;try{p.assembler.close();}catch(IOException ignored){ }}
         if((active!=null && active.id.equals(id)) || (cleanup!=null && cleanup.row.id.equals(id))) {
             // Clear queued protocol writes and close the file before unlinking. The bean's
             // physical recording is left alone; a later connection respects the tombstone.
-            disconnect("已停止此录音的手机接收和核验，正在删除手机副本",false);
+            localDeletionStop=true;
+            try{disconnect("已停止此录音的手机接收和核验，正在删除手机副本",false);}finally{localDeletionStop=false;}
         }
     }
     private void closeGatt() {
         deviceFiles.unavailable(device,"蓝牙未连接；显示上次成功读取的列表");
         Settings.prefs(this).edit().putBoolean("ble_ready",false).apply();
         RuntimeTelemetry.lastStableDurationMs=Settings.prefs(this).getLong("last_stable_ms",0L);requestedDownload=0;
-        generation++;ready=false;passiveStandby=false;writing=false;writeSerial++;tx.clear();stage="";writeChar=null;notifyChar=null;crypto=null;
+        generation++;ready=false;passiveStandby=false;writing=false;writeSerial++;tx.clear();liveDegradedMidStream.clear();drainFileId=0;
+        RuntimeTelemetry.liveDeferredWeakSignal=false;stage="";writeChar=null;notifyChar=null;crypto=null;
         BluetoothGatt previous=gatt;gatt=null;
         if(previous!=null) {try {previous.disconnect();}catch(RuntimeException ignored) { }try {previous.close();}catch(RuntimeException ignored) { }}
     }
@@ -519,6 +541,9 @@ public final class RecorderService extends Service {
                 abortInventory("设备拒绝读取列表；保留上次成功读取的列表");
                 if(p.type==0x1b) {listType=0x1a;requestInventory();return;}
             }
+            if((p.type==0x1a||p.type==0x1b) && p.id==7 && active!=null && active.backfill && active.backfillPhase==LiveBackfill.Phase.TAIL) {
+                requestBackfillHead(active);return;
+            }
             if((p.type==0x1a||p.type==0x1b) && p.id==7 && active!=null && !active.live && active.readback==null
                     && active.resumedOffset>0 && !forceZeroOffset.contains(active.fileId)) {
                 fallbackActiveToZero("设备不支持偏移续传，自动从头补收");
@@ -590,10 +615,18 @@ public final class RecorderService extends Service {
         if(p.id==6 && b.length>=4) {
             cancelCleanup("新录音优先，暂缓豆内清理");
             long id=Protocol.u32(b,0);if(id==0)return;currentId=id;recording=true;paused=false;deviceReportedIdle=false;
+            RuntimeTelemetry.beanRecording=true;RuntimeTelemetry.beanPaused=false;
+            safeReadRssi();
             if(active!=null && active.fileId!=id)abandon("新录音优先，旧录音稍后补收");
-            if(crypto!=null && crypto.ready())startFile(id,0,true);return;
+            if(crypto!=null && crypto.ready())startOrDeferLiveFile(id);
+            return;
         }
         if(p.id==0x0e) {if(p.type==listType)fileList(new Protocol.FileList(b,p.type==0x1b));return;}
+        if(active==null && drainFileId!=0 && (p.id==7 || p.id==8 || p.id==0x12 || p.id==0x0a)) {
+            drainLastData=SystemClock.elapsedRealtime();
+            if(p.id==0x0a && (b.length<9 || LiveBackfill.endFileId(b)==drainFileId))endDrain("豆内剩余分片已传完");
+            return;
+        }
         Cleanup attempt=cleanup;
         boolean reading=attempt!=null && attempt.content!=null;
         if(attempt!=null && attempt.contentRead && !attempt.guard.sent() && (p.id==7 || p.id==8 || p.id==0x12)) {
@@ -605,7 +638,16 @@ public final class RecorderService extends Service {
                 cancelCleanup("豆内复读文件头与所选录音不一致，已保留豆内原件");return;
             }
             if(b.length<8 || Protocol.u32(b,0)!=a.fileId)return;
-            a.key=crypto.fileKey(b,a.fileId);long size=Protocol.u32(b,4);
+            DeviceCrypto.FileKey headerKey;
+            try{headerKey=crypto.fileKey(b,a.fileId);}
+            catch(GeneralSecurityException e) {
+                // A 1A/07 repeated mid-transfer is acknowledged with a header that does not verify while the
+                // bean keeps streaming under the previous key.
+                if(!reading && a.key!=null){EventLog.add(this,"忽略传输中重复请求返回的文件头 id="+a.fileId);return;}
+                if(!reading && a.backfill){retryBackfillRequest(a);return;}
+                throw e;
+            }
+            a.key=headerKey;long size=Protocol.u32(b,4);
             if(reading && size!=a.sizeUnit.bytesPerFrame && size!=attempt.row.bytes/RecordingSizeUnit.AUDIO_BYTES.bytesPerFrame*a.sizeUnit.bytesPerFrame) {
                 cancelCleanup("本次豆内文件头与已备份录音不符，已保留豆内原件");return;
             }
@@ -621,7 +663,9 @@ public final class RecorderService extends Service {
             if(!a.live && size>0)a.expected=size;
             if(reading){attempt.guard.contentActivity(SystemClock.elapsedRealtime());return;}
             EventLog.add(this,"文件头 id="+a.fileId+" mode="+(a.live?"live":"offline")+" headSize="+size+" listSize="+a.listSize+" sizeUnit="+a.sizeUnit+" offset="+a.resumedOffset);
-            a.lastData=SystemClock.elapsedRealtime();setStatus(a.live?"录音中，正在接收原音":a.initialBytes>0?"正在断点续收完整录音":"正在补收完整录音");return;
+            a.lastData=SystemClock.elapsedRealtime();
+            if(a.backfill && size>0 && decoder.rejected==a.rejectedAtStart && a.assembler.complete(size,a.sizeUnit)){sealBackfillEarly(a);return;}
+            setStatus(a.live?"录音中，正在接收原音":a.backfill?"正在从豆内补齐实时流缺失的片段":a.initialBytes>0?"正在断点续收完整录音":"正在补收完整录音");return;
         }
         if(p.id==8||p.id==0x12) {
             if(reading && (a.key==null || b.length<165)) {cancelCleanup("豆内复读分片缺少有效文件头或音频，已保留豆内原件");return;}
@@ -635,14 +679,17 @@ public final class RecorderService extends Service {
                 byte[] decrypted=a.key.decrypt(seq,Arrays.copyOfRange(b,o+5,o+165));
                 if(!a.assembler.add(seq,decrypted))a.duplicates++;
                 a.sliceFlags.add(b[o+4]&255);
+                if((b[o+4]&255)==LiveBackfill.FLAG_HIGHLIGHT)a.highlights.add(seq);
             }
             a.lastData=SystemClock.elapsedRealtime();
+            a.lastSliceAt=a.lastData;
             a.end.data(a.lastData);
             if(reading)attempt.guard.contentActivity(a.lastData);
             else {
                 long expBytes=a.headSize>a.sizeUnit.bytesPerFrame?(a.headSize/a.sizeUnit.bytesPerFrame)*160L
                         :(a.listSize>OfflineReadback.FRAME_MILLIS?(a.listSize/OfflineReadback.FRAME_MILLIS)*160L:0L);
-                long durMs=a.listSize>OfflineReadback.FRAME_MILLIS?a.listSize:a.assembler.frames()*20L;
+                // Live seq numbers are absolute, so elapsed audio is (last+1) frames although the head is never streamed.
+                long durMs=a.live?LiveBackfill.receivedDurationMs(a.assembler):a.listSize>OfflineReadback.FRAME_MILLIS?a.listSize:a.assembler.frames()*20L;
                 double elapsed=Math.max(0.05,(a.lastData-a.startedAt)/1000.0);
                 long deltaBytes=Math.max(0L,a.assembler.bytes()-a.initialBytes);
                 RuntimeTelemetry.bleTransfer=new RuntimeTelemetry.Transfer(a.id,a.fileId,false,a.live,false,
@@ -650,9 +697,18 @@ public final class RecorderService extends Service {
                 if(a.lastData-lastProgress>1000) {
                     if(getFilesDir().getUsableSpace()<16L*1024*1024) {failActive("手机存储空间不足，已暂停接收");return;}
                     lastProgress=a.lastData;store.progress(a.id,a.assembler.bytes());
-                    if(!a.live && a.readback==null && a.headSize>0)try{a.assembler.checkpoint(a.headSize);}catch(IOException ignored){ }
+                    if(a.readback==null && decoder.rejected==a.rejectedAtStart && (a.live || a.headSize>0)) {
+                        try{a.assembler.checkpoint(a.live?0L:a.headSize);}catch(IOException ignored){ }
+                    }
                     setStatus((a.live?"录音中，已接收 ":a.initialBytes>0?"断点续收中，已接收 ":"补收中，已接收 ")+ConnectionHud.formatMb(a.assembler.bytes()));
                 }
+                if(a.live && recording && !paused && !ConnectionHud.isLiveSignalStable(RuntimeTelemetry.rssiDbm)
+                        && a.assembler.internalGaps()>25) {
+                    degradeLiveToBean(a,"蓝牙信号转弱且出现丢片，已暂存实时分片，结束后只补缺失部分");
+                    return;
+                }
+                if(a.backfill && a.key!=null && a.headSize>0 && !a.end.received() && decoder.rejected==a.rejectedAtStart
+                        && a.assembler.complete(a.headSize,a.sizeUnit)) {sealBackfillEarly(a);return;}
             }
             if(a.stopConfirmed || a.end.received())scheduleSettle(a);return;
         }
@@ -664,7 +720,16 @@ public final class RecorderService extends Service {
             a.lastData=SystemClock.elapsedRealtime();a.end.received(a.lastData);
             if(reading)attempt.guard.contentActivity(a.lastData);
             EventLog.add(this,"收到传输结束 id="+a.fileId+" payload="+b.length+" frames="+a.assembler.frames());
-            if(a.live) {if(!recording)a.stopConfirmed=true;requestInventory();}
+            if(a.live) {
+                long endMs=LiveBackfill.endDurationMs(b,a.fileId);
+                if(endMs>0) {
+                    // Use the duration reported by the live end notification for backfill.
+                    a.liveEndMs=endMs;a.closedListSize=endMs;a.finalSize=true;a.stopConfirmed=true;
+                    if(a.stoppedAt==0L)a.stoppedAt=a.lastData;
+                }
+                if(!recording) {a.stopConfirmed=true;if(a.stoppedAt==0L)a.stoppedAt=a.lastData;}
+                if(!listing && !a.finalSize)requestInventory();
+            }
             scheduleSettle(a);
         }
     }
@@ -687,7 +752,7 @@ public final class RecorderService extends Service {
         cooldown.clear();
         uploads.kick();
         connectionSync.connected();
-        requestInventory();if(currentId>0 && recording)startFile(currentId,0,true);
+        requestInventory();if(currentId>0 && recording)startOrDeferLiveFile(currentId);
     }
     private void beginCleanup(RecordingStore.Row row,boolean manual) {
         if(row==null)return;
@@ -830,14 +895,30 @@ public final class RecorderService extends Service {
     private void applyRecording(boolean value) {
         boolean was=recording;recording=value;RuntimeTelemetry.beanRecording=value;
         if(value) {
-            if(active!=null && active.live) {active.stopConfirmed=false;active.finalSize=false;active.settle++;}
+            safeReadRssi();
+            if(active!=null && active.live) {
+                boolean resumeStream=active.stopConfirmed || active.end.received();
+                active.stopConfirmed=false;active.stoppedAt=0L;active.finalSize=false;active.closedListSize=0L;active.end.reset();active.settle++;
+                if(resumeStream && ConnectionHud.isLiveSignalStable(RuntimeTelemetry.rssiDbm)) {
+                    send(Protocol.requestFile(active.fileId,active.assembler.resumeRequestOffset(),true));
+                    setStatus("继续录音，恢复实时接收原音");
+                }
+            }
             if(active!=null && !active.live)abandon("录音优先，旧录音稍后补收");
-            if(currentId>0 && crypto!=null && crypto.ready())startFile(currentId,0,true);
-            else if(ready)requestInventory();
+            if(currentId>0 && crypto!=null && crypto.ready()) {
+                if(active==null || active.fileId!=currentId)startOrDeferLiveFile(currentId);
+            } else if(ready)requestInventory();
         }else if(was || (active!=null && active.live)) {
             currentId=0;
-            if(active!=null && active.live) {active.stopConfirmed=true;active.lastData=SystemClock.elapsedRealtime();store.stopped(active.id);scheduleSettle(active);}
-            long gen=generation;worker.postDelayed(()->{if(gen==generation && ready)requestInventory();},1200);
+            RuntimeTelemetry.liveDeferredWeakSignal=false;
+            liveDegradedMidStream.clear();
+            if(active!=null && active.live) {
+                long now=SystemClock.elapsedRealtime();
+                active.stopConfirmed=true;if(active.stoppedAt==0L)active.stoppedAt=now;
+                active.lastData=now;store.stopped(active.id);scheduleSettle(active);
+            }
+            long delayMs=(active!=null && active.live)?220L:450L;
+            long gen=generation;worker.postDelayed(()->{if(gen==generation && ready && (active==null || !active.finalSize))requestInventory();},delayMs);
         }
     }
     private void requestInventory() {
@@ -864,20 +945,24 @@ public final class RecorderService extends Service {
         // Ignore old response families after fallback, but still reconcile complete entries.
         for(Protocol.Entry e:list.entries)inventory.put(e.id,e);
         if(recording && list.activeId>0) {
-            currentId=list.activeId;if(active==null || active.fileId!=currentId)startFile(currentId,0,true);
+            currentId=list.activeId;if(active==null || active.fileId!=currentId)startOrDeferLiveFile(currentId);
         }
         for(Protocol.Entry e:list.entries) {
             if(active!=null && active.fileId==e.id && active.live) {
                 active.listSize=e.size;
-                if(paused && e.endSeconds>0 && list.activeId!=e.id) {
-                    paused=false;recording=false;currentId=0;active.stopConfirmed=true;store.stopped(active.id);
+                if((recording || paused) && e.endSeconds>0 && list.activeId!=e.id) {
+                    paused=false;recording=false;currentId=0;
+                    RuntimeTelemetry.beanPaused=false;RuntimeTelemetry.beanRecording=false;RuntimeTelemetry.liveDeferredWeakSignal=false;
+                    active.stopConfirmed=true;if(active.stoppedAt==0L)active.stoppedAt=SystemClock.elapsedRealtime();
+                    store.stopped(active.id);
                 }
-                if(active.stopConfirmed && e.size>0 && (list.activeId!=e.id || e.endSeconds>0)) {
-                    // On supported 04.x firmware this list field is duration in
-                    // milliseconds, whereas 1A07 reports transport bytes.
-                    // A closed list entry permits an offline verification pull;
-                    // it must never supply the byte count that seals live data.
-                    active.finalSize=true;scheduleSettle(active);
+                boolean closedOnBean=e.size>0 && list.activeId!=e.id
+                        && (listType==0x1b ? e.endSeconds>0 : deviceReportedIdle || !recording);
+                if(active.stopConfirmed && closedOnBean) {
+                    store.ensure(device,e.id,e.size);
+                    active.closedListSize=e.size;
+                    active.finalSize=true;
+                    scheduleSettle(active);
                 }
             }
         }
@@ -885,6 +970,13 @@ public final class RecorderService extends Service {
             listPage++;listDeadline=SystemClock.elapsedRealtime()+10000;send(Protocol.list(listType,listPage));return;
         }
         listing=false;everListed=true;
+        if(active!=null && active.live && active.stopConfirmed) {
+            if(active.finalSize)scheduleSettle(active);
+            else {
+                long gen=generation;
+                worker.postDelayed(()->{if(gen==generation && ready && active!=null && active.live && active.stopConfirmed && !active.finalSize)requestInventory();},450L);
+            }
+        }
         deviceFiles.complete(device,inventory,listActiveId,listType==0x1b,firmware);
         connectionSync.capture(device,inventory,listActiveId,recording || active!=null,listType==0x1b,syncEnabled());
         if(requestedDownload>0) {
@@ -933,7 +1025,7 @@ public final class RecorderService extends Service {
      *    Only when the oldest item completes its closed loop does the pipeline advance to the next oldest item.
      */
     private void advancePipeline() {
-        if(!ready || active!=null || recording || listActiveId>0 || listing || cleanup!=null
+        if(!ready || active!=null || recording || listActiveId>0 || listing || cleanup!=null || drainFileId!=0
                 || cleanupQuarantinedGeneration==generation || crypto==null || !crypto.ready())return;
         String endpoint=Settings.prefs(this).getString("endpoint","");
         if(!endpoint.isEmpty() && (uploads.isBusy() || store.nextUpload()!=null)) {
@@ -987,10 +1079,195 @@ public final class RecorderService extends Service {
             beginCleanup(store.nextCleanup(device,Settings.prefs(this).getBoolean("auto_cleanup",false),syncEnabled()),false);
         }
     }
+    private void startOrDeferLiveFile(long fileId) {
+        if(!ready || crypto==null || !crypto.ready() || fileId<=0)return;
+        if(active!=null && active.fileId==fileId)return;
+        if(drainFileId!=0){setStatus("录音中；上一条录音的补齐传输结束后接入实时流");return;}
+        int rssi=RuntimeTelemetry.rssiDbm;
+        if(liveDegradedMidStream.contains(fileId) || !ConnectionHud.isLiveSignalStable(rssi)) {
+            RecordingStore.Row row=store.ensure(device,fileId,0);
+            RuntimeTelemetry.liveDeferredWeakSignal=true;
+            if(!liveDegradedMidStream.contains(fileId)) {
+                String msg="蓝牙信号较弱（"+rssi+" dBm），录音豆独立存储中，结束后自动补收";
+                if(row!=null && !row.saved() && !row.localDeleted() && !row.reconciled())store.waiting(row.id,msg);
+                setStatus(msg);
+                EventLog.add(this,"信号较弱暂缓实时拉流 id="+fileId+" rssi="+rssi);
+            }
+            return;
+        }
+        RuntimeTelemetry.liveDeferredWeakSignal=false;
+        startFile(fileId,0,true);
+    }
+    private void degradeLiveToBean(Active a,String reason) {
+        if(a==null || active!=a)return;
+        liveDegradedMidStream.add(a.fileId);
+        RuntimeTelemetry.liveDeferredWeakSignal=true;
+        parkTransfer(reason);
+        if(gatt!=null)try{gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_BALANCED);}catch(RuntimeException ignored){ }
+        setStatus(reason);
+    }
+    /** Keep received live frames (head missing by design) instead of discarding them on a stall or link loss. */
+    private void parkTransfer(String reason) {
+        Active a=active;
+        if(a==null || a.readback!=null || (!a.live && !a.backfill) || a.assembler.frames()==0 || (cleanup!=null && cleanup.content==a))return;
+        if(parked!=null)dropParked("新的中断录音替换了暂存的实时分片");
+        active=null;RuntimeTelemetry.bleTransfer=null;parked=a;a.settle++;
+        traceTransfer(a,reason+"，暂存实时分片");
+        store.progress(a.id,a.assembler.bytes());
+        store.waiting(a.id,reason+"；手机已保留 "+a.assembler.frames()+" 帧，重连后只补缺失部分");
+        EventLog.add(this,"暂存实时分片 "+a.fileId+"：seq "+a.assembler.firstSequence()+"…"+a.assembler.lastSequence()+"，共 "+a.assembler.frames()+" 帧");
+    }
+    private void dropParked(String reason) {
+        Active p=parked;parked=null;if(p==null)return;
+        Active current=active;active=p;abandon(reason);active=current;
+    }
+    private void resumeParked(RecordingStore.Row row,long size,boolean live) {
+        Active a=parked;parked=null;
+        if(active!=null)abandon("录音切换，稍后补收");
+        if(!store.receiving(row.id)){parked=a;return;}
+        long now=SystemClock.elapsedRealtime();
+        active=a;a.settle++;a.end.reset();a.key=null;a.headSize=-1;a.lastData=now;a.lastSliceAt=now;a.rejectedAtStart=decoder.rejected;
+        store.progress(a.id,a.assembler.bytes());
+        if(gatt!=null)try{gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH);}catch(RuntimeException ignored){ }
+        if(live) {
+            a.live=true;a.backfill=false;a.stopConfirmed=false;a.stoppedAt=0L;a.finalSize=false;a.closedListSize=0L;a.liveEndMs=0L;
+            RuntimeTelemetry.bleTransfer=new RuntimeTelemetry.Transfer(a.id,a.fileId,false,true,false,a.assembler.bytes(),0L,
+                    LiveBackfill.receivedDurationMs(a.assembler),0.0,true);
+            send(Protocol.requestFile(a.fileId,0,true));
+            setStatus("重新连接后仍在录音，恢复实时接收");
+            EventLog.add(this,"恢复实时接收 "+a.fileId+"，已暂存 "+a.assembler.frames()+" 帧");
+            return;
+        }
+        if(size>0){a.listSize=size;if(a.closedListSize<=0)a.closedListSize=size;}
+        a.stopConfirmed=true;
+        beginBackfill(a);
+    }
+    /** Fetch only what the live stream did not deliver; see {@link LiveBackfill} for the measured protocol. */
+    private void beginBackfill(Active a) {
+        if(active!=a)return;
+        long expected=a.liveEndMs>0?a.liveEndMs/LiveBackfill.FRAME_MILLIS
+                :(a.closedListSize>0 && a.closedListSize%LiveBackfill.FRAME_MILLIS==0?a.closedListSize/LiveBackfill.FRAME_MILLIS:-1L);
+        LiveBackfill.Plan plan=LiveBackfill.plan(a.assembler,expected,a.sizeUnit);
+        a.live=false;a.backfill=true;a.backfillPhase=plan.phase;a.key=null;a.headSize=-1;a.end.reset();a.settle++;
+        a.resumedOffset=plan.offset;a.lastData=SystemClock.elapsedRealtime();
+        if(a.listSize<=OfflineReadback.FRAME_MILLIS && a.closedListSize>0)a.listSize=a.closedListSize;
+        int first=a.assembler.firstSequence();
+        EventLog.add(this,"实时流补齐 id="+a.fileId+"：已收 "+a.assembler.frames()+" 帧（seq "+first+"…"+a.assembler.lastSequence()
+                +"），应有 "+expected+" 帧；"+(plan.phase==LiveBackfill.Phase.TAIL?"先从第 "+plan.fromFrame+" 帧补收断点之后":"补收开头 "+Math.max(0,first)+" 帧"));
+        setStatus(plan.phase==LiveBackfill.Phase.TAIL?"连接曾中断，正在补收断点之后的录音":"录音已结束，正在补齐开头 "+Math.max(0,first)*LiveBackfill.FRAME_MILLIS+" ms");
+        if(gatt!=null)try{gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH);}catch(RuntimeException ignored){ }
+        send(Protocol.requestFile(a.fileId,plan.offset,false));
+    }
+    /** The request landed while an earlier stream was still running; ask again once the bean is quiet. */
+    private void retryBackfillRequest(Active a) {
+        long stamp=++a.settle;
+        EventLog.add(this,"补齐请求遇到仍在进行的传输，稍后重发 id="+a.fileId);
+        worker.postDelayed(()->{
+            if(active!=a || a.settle!=stamp || a.key!=null || !ready)return;
+            a.lastData=SystemClock.elapsedRealtime();send(Protocol.requestFile(a.fileId,a.resumedOffset,false));
+        },2000L);
+    }
+    private void requestBackfillHead(Active a) {
+        if(active!=a)return;
+        a.backfillPhase=LiveBackfill.Phase.HEAD;a.key=null;a.headSize=-1;a.end.reset();a.settle++;a.resumedOffset=0L;
+        a.lastData=SystemClock.elapsedRealtime();
+        EventLog.add(this,"断点之后已补收，再补开头 "+Math.max(0,a.assembler.firstSequence())+" 帧 id="+a.fileId);
+        setStatus("正在补齐录音开头");
+        send(Protocol.requestFile(a.fileId,0,false));
+    }
+    /** Seal as soon as every frame is present; the rest of this stream only repeats frames already verified live. */
+    private void sealBackfillEarly(Active a) {
+        if(active!=a)return;
+        long fileId=a.fileId;
+        drainFileId=fileId;drainLastData=SystemClock.elapsedRealtime();scheduleDrainCheck();
+        try {
+            int frames=a.assembler.frames();long bytes=a.assembler.bytes();
+            a.assembler.close();
+            saveHighlights(a);
+            long duration=store.saveReceived(a.id,fileId,a.source,frames,false,a.liveEndMs);
+            forceZeroOffset.remove(fileId);
+            active=null;RuntimeTelemetry.bleTransfer=null;
+            traceTransfer(a,"实时流补齐后完整");
+            if(gatt!=null)try{gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_BALANCED);}catch(RuntimeException ignored){ }
+            EventLog.add(this,"实时录音补齐后保存 "+fileId+"，"+bytes+" B，"+duration+" ms；豆内剩余分片传完前不发新请求");
+            setStatus("录音已完整保存；"+(Settings.prefs(this).getString("endpoint","").isEmpty()?"未配置中转，仅保存在手机":"正在上传至中转"));
+            uploads.kick();
+        }catch(Exception e) {
+            String detail=e.getMessage()==null?e.getClass().getSimpleName():e.getMessage().replace('\n',' ');
+            failActive("实时录音补齐后封装失败："+(detail.length()>160?detail.substring(0,160):detail));
+        }
+    }
+    private void scheduleDrainCheck() {
+        long gen=generation;
+        worker.postDelayed(()->{
+            if(gen!=generation || drainFileId==0)return;
+            if(SystemClock.elapsedRealtime()-drainLastData>=3000L)endDrain("豆内剩余分片已静默 3 秒");else scheduleDrainCheck();
+        },1000L);
+    }
+    private void endDrain(String reason) {
+        long id=drainFileId;drainFileId=0;if(id==0)return;
+        EventLog.add(this,reason+"，结束 "+id+" 的补齐传输");
+        if(!ready || active!=null)return;
+        if(recording && !paused && currentId>0)startOrDeferLiveFile(currentId);
+        else if(!recording && !listing)advancePipeline();
+    }
+    private void saveHighlights(Active a) {
+        if(a.highlights.isEmpty())return;
+        List<Long> ms=LiveBackfill.highlightMillis(a.highlights);
+        try{store.saveHighlights(a.id,ms);EventLog.add(this,"录音 "+a.fileId+" "+LiveBackfill.describeHighlights(ms));}
+        catch(IOException e){EventLog.add(this,"保存重点标记失败 "+a.fileId);}
+    }
+    private boolean canSealLiveDirectly(Active a) {
+        if(a==null || !a.live || !a.stopConfirmed || !a.finalSize || recording || paused)return false;
+        // The stop status can arrive without an end packet. Check the contiguous frame count and mux duration.
+        if(!RecordingSizeUnit.usesVerifiedTransportProtocol(firmware) || a.key==null)return false;
+        if(listType!=0x1b && !deviceReportedIdle && a.liveEndMs<=0)return false;
+        if(decoder.rejected!=a.rejectedAtStart)return false;
+        if(a.closedListSize<=OfflineReadback.FRAME_MILLIS || a.closedListSize%OfflineReadback.FRAME_MILLIS!=0)return false;
+        long expectedFrames=a.closedListSize/OfflineReadback.FRAME_MILLIS;
+        return expectedFrames>1 && a.assembler.contiguous() && a.assembler.frames()==expectedFrames;
+    }
+    private static long liveQuietElapsed(Active a,long now) {
+        long anchor=Math.max(a.stoppedAt,a.lastSliceAt);
+        if(a.end.received())anchor=Math.max(anchor,a.lastData);
+        return Math.max(0L,now-anchor);
+    }
+    private void finishLiveDirectly(Active a) {
+        if(active!=a || !canSealLiveDirectly(a))return;
+        long fileId=a.fileId,listed=a.closedListSize;
+        try {
+            int frames=a.assembler.frames();
+            long bytes=a.assembler.bytes();
+            a.assembler.close();
+            saveHighlights(a);
+            long duration=store.saveReceived(a.id,fileId,a.source,frames,false,listed);
+            forceZeroOffset.remove(fileId);
+            active=null;RuntimeTelemetry.bleTransfer=null;
+            traceTransfer(a,"实时零重传直通校验通过");
+            if(gatt!=null)try{gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_BALANCED);}catch(RuntimeException ignored){ }
+            EventLog.add(this,"实时录音直通保存 "+fileId+"，"+bytes+" B，"+duration+" ms");
+            setStatus("实时录音已保存；"+(Settings.prefs(this).getString("endpoint","").isEmpty()?"未配置中转，仅保存在手机":"正在立即上传至中转"));
+            uploads.kick();
+            long gen=generation;worker.postDelayed(()->{if(gen==generation)advancePipeline();},300);
+        }catch(Exception e) {
+            forceZeroOffset.add(fileId);
+            active=null;RuntimeTelemetry.bleTransfer=null;
+            traceTransfer(a,"实时直封校验回退离线重收");
+            try{a.assembler.close();}catch(IOException ignored){ }
+            RecordingAssembler.clearResume(a.source);
+            a.source.delete();
+            store.file(a.id,".ogg.tmp").delete();
+            store.progress(a.id,0L);
+            store.waiting(a.id,"实时封装需重新核对，正在从豆内完整重收");
+            EventLog.add(this,"实时直封回退离线重收 "+fileId+"："+e.getClass().getSimpleName());
+            if(ready && !recording && !listing)startFile(fileId,listed,false);
+        }
+    }
     private void startFile(long fileId,long size,boolean live) {
-        if(!ready || crypto==null || !crypto.ready() || (active!=null && active.fileId==fileId))return;
+        if(!ready || crypto==null || !crypto.ready() || (active!=null && active.fileId==fileId) || drainFileId!=0)return;
         if(cooldown.getOrDefault(fileId,0L)>SystemClock.elapsedRealtime())return;
         RecordingStore.Row row=store.ensure(device,fileId,size);if(row.saved() || row.localDeleted() || row.reconciled())return;
+        if(parked!=null && parked.id.equals(row.id)){resumeParked(row,size,live);return;}
         if(!live) {
             RecordingStore.Row existingComplete=store.findCompleteByFileId(fileId,size);
             if(existingComplete!=null && !existingComplete.id.equals(row.id)) {
@@ -1039,6 +1316,25 @@ public final class RecorderService extends Service {
     }
     private void scheduleSettle(Active a) {
         long stamp=++a.settle;
+        long nowAtSchedule=SystemClock.elapsedRealtime();
+        long waitMs;
+        if(a.live) {
+            if(!a.stopConfirmed)waitMs=TransferEnd.QUIET_MILLIS+25L;
+            else if(canSealLiveDirectly(a)) {
+                long rem=Math.max(0L,TransferEnd.LIVE_EXACT_QUIET_MILLIS-liveQuietElapsed(a,nowAtSchedule));
+                waitMs=rem+25L;
+            } else if(a.finalSize) {
+                long rem=Math.max(0L,LIVE_FALLBACK_QUIET_MILLIS-liveQuietElapsed(a,nowAtSchedule));
+                waitMs=rem+25L;
+            } else {
+                waitMs=450L;
+            }
+        } else if(cleanup==null && a.readback==null && a.key!=null && a.headSize>0
+                && decoder.rejected==a.rejectedAtStart && a.assembler.complete(a.headSize,a.sizeUnit) && a.end.received()) {
+            waitMs=a.end.remainingMillis(nowAtSchedule,TransferEnd.LIVE_EXACT_QUIET_MILLIS)+25L;
+        } else {
+            waitMs=a.end.received()?a.end.remainingMillis(nowAtSchedule,TransferEnd.QUIET_MILLIS)+25L:TransferEnd.QUIET_MILLIS+25L;
+        }
         worker.postDelayed(()->{
             if(a.settle!=stamp)return;
             long now=SystemClock.elapsedRealtime();
@@ -1049,20 +1345,34 @@ public final class RecorderService extends Service {
             }
             if(active!=a)return;
             if(!a.live) {
-                if(a.end.settled(now))finishIfComplete(a);
+                boolean exactOffline=a.readback==null && a.key!=null && a.headSize>0
+                        && decoder.rejected==a.rejectedAtStart && a.assembler.complete(a.headSize,a.sizeUnit);
+                long reqQuiet=exactOffline?TransferEnd.LIVE_EXACT_QUIET_MILLIS:TransferEnd.QUIET_MILLIS;
+                if(a.end.settledWithin(now,reqQuiet))finishIfComplete(a);
                 else if(a.end.received())scheduleSettle(a);
                 return;
             }
             if(!a.stopConfirmed)return;
+            if(canSealLiveDirectly(a)) {
+                if(liveQuietElapsed(a,now)>=TransferEnd.LIVE_EXACT_QUIET_MILLIS)finishLiveDirectly(a);
+                else scheduleSettle(a);
+                return;
+            }
             if(a.finalSize) {
-                long id=a.fileId;long listed=a.listSize;
-                abandon("录音结束，正在取得完整文件头并补收校验");startFile(id,listed,false);
-            }else requestInventory();
-        },TransferEnd.QUIET_MILLIS+25L);
+                if(liveQuietElapsed(a,now)<LIVE_FALLBACK_QUIET_MILLIS) {
+                    scheduleSettle(a);
+                    return;
+                }
+                if(listing){scheduleSettle(a);return;}
+                beginBackfill(a);
+            }else if(!listing)requestInventory();
+        },waitMs);
     }
     private void finishIfComplete(Active a) {
         if(active!=a || a.live)return;
-        if(!a.end.settled(SystemClock.elapsedRealtime()))return;
+        boolean exactOffline=a.readback==null && a.key!=null && a.headSize>0
+                && decoder.rejected==a.rejectedAtStart && a.assembler.complete(a.headSize,a.sizeUnit);
+        if(!a.end.settledWithin(SystemClock.elapsedRealtime(),exactOffline?TransferEnd.LIVE_EXACT_QUIET_MILLIS:TransferEnd.QUIET_MILLIS))return;
         if(a.key==null || a.headSize<=0){failActive("设备尚未报告最终文件长度，等待补收");return;}
         boolean matched=false;
         try {
@@ -1083,7 +1393,8 @@ public final class RecorderService extends Service {
                 deferReadback(result==OfflineReadback.Result.SHORTER?"本次音频短于已保留分片":"两次补收的音频内容不同");return;
             }
             if(result==OfflineReadback.Result.INCOMPLETE) {
-                if(a.readback==null && (a.resumedOffset>0L || a.initialBytes>0L) && !forceZeroOffset.contains(a.fileId)) {
+                if(a.backfill && a.backfillPhase==LiveBackfill.Phase.TAIL){requestBackfillHead(a);return;}
+                if(!a.backfill && a.readback==null && (a.resumedOffset>0L || a.initialBytes>0L) && !forceZeroOffset.contains(a.fileId)) {
                     fallbackActiveToZero("断点续传核对未通过，已删除手机旧分片并从零重收");
                     return;
                 }
@@ -1092,7 +1403,8 @@ public final class RecorderService extends Service {
             }
             matched=result==OfflineReadback.Result.MATCHED;
             long bytes=a.assembler.bytes();a.assembler.close();
-            long duration=store.saveReceived(a.id,a.fileId,a.source,a.assembler.frames(),matched);
+            saveHighlights(a);
+            long duration=store.saveReceived(a.id,a.fileId,a.source,a.assembler.frames(),matched,a.backfill?a.liveEndMs:0L);
             forceZeroOffset.remove(a.fileId);
             active=null;RuntimeTelemetry.bleTransfer=null;
             traceTransfer(a,matched?"豆内长度异常，两次独立补收 SHA256 一致":"校验通过");
@@ -1102,7 +1414,7 @@ public final class RecorderService extends Service {
             uploads.kick();
             long gen=generation;worker.postDelayed(()->{if(gen==generation)advancePipeline();},300);
         }catch(Exception e) {
-            if(!matched && a.readback==null && (a.resumedOffset>0L || a.initialBytes>0L) && !forceZeroOffset.contains(a.fileId)) {
+            if(!matched && !a.backfill && a.readback==null && (a.resumedOffset>0L || a.initialBytes>0L) && !forceZeroOffset.contains(a.fileId)) {
                 fallbackActiveToZero("续传音频封装核对失败，已删除手机旧分片并从零重收");
                 return;
             }
@@ -1135,6 +1447,23 @@ public final class RecorderService extends Service {
     private void abandon(String reason,long retryAt) {
         Active a=active;active=null;RuntimeTelemetry.bleTransfer=null;if(a==null)return;
         traceTransfer(a,reason);
+        if(a.live && a.readback==null) {
+            long contiguousBytes=0L;
+            if(decoder.rejected==a.rejectedAtStart && a.listSize!=OfflineReadback.FRAME_MILLIS
+                    && a.assembler.firstMissingSequence()>=2) {
+                contiguousBytes=a.assembler.firstMissingSequence()*160L;
+                RecordingAssembler.resetResumeAttempts(a.source);
+                try{a.assembler.checkpoint(0L);}catch(IOException ignored){ }
+            } else {
+                RecordingAssembler.clearResume(a.source);
+            }
+            try{a.assembler.close();}catch(IOException ignored){ }
+            if(contiguousBytes==0L && a.listSize!=OfflineReadback.FRAME_MILLIS)a.source.delete();
+            store.progress(a.id,contiguousBytes);
+            store.waiting(a.id,reason,retryAt);
+            EventLog.add(this,reason+"，文件 "+a.fileId);
+            return;
+        }
         if(!a.live && a.readback==null) {
             long contiguousBytes=a.assembler.firstMissingSequence()*160L;
             boolean progressed=a.assembler.overlapVerified()
@@ -1180,11 +1509,13 @@ public final class RecorderService extends Service {
                 .setVisibility(Notification.VISIBILITY_PRIVATE).addAction(new Notification.Action.Builder(null,"停止连接",stop).build()).build();
     }
     static final class Active {
-        final long fileId;final String id;final boolean live;final RecordingAssembler assembler;
+        final long fileId;final String id;boolean live;final RecordingAssembler assembler;
         final File source;final OfflineReadback readback;
-        final TransferEnd end=new TransferEnd();final Set<Integer> sliceFlags=new TreeSet<>();final int rejectedAtStart;final RecordingSizeUnit sizeUnit;
+        final TransferEnd end=new TransferEnd();final Set<Integer> sliceFlags=new TreeSet<>();int rejectedAtStart;final RecordingSizeUnit sizeUnit;
+        final Set<Long> highlights=new TreeSet<>();
+        boolean backfill;LiveBackfill.Phase backfillPhase;long liveEndMs;
         final long startedAt=SystemClock.elapsedRealtime();
-        long expected,headSize=-1,listSize,lastData=startedAt,settle,duplicates,initialBytes,resumedOffset;
+        long expected,headSize=-1,listSize,closedListSize,lastData=startedAt,lastSliceAt=startedAt,stoppedAt,settle,duplicates,initialBytes,resumedOffset;
         int resumeAttempt;
         boolean stopConfirmed,finalSize;DeviceCrypto.FileKey key;
         Active(long fileId,String id,long size,boolean live,File source,OfflineReadback readback,int rejected,RecordingSizeUnit sizeUnit) throws IOException {

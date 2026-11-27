@@ -201,6 +201,10 @@ public final class RecordingAssembler implements Closeable {
     public int lastSequence() { return received.length()-1; }
     public int firstMissingSequence() { return received.nextClearBit(0); }
     public int gapsBeforeLast() { return received.length()-frames(); }
+    /** First missing frame at or after {@code from}; equals the frame count past the last one when none. */
+    public int nextMissingFrom(int from) { return received.nextClearBit(Math.max(0,from)); }
+    /** Missing frames between the first and last received frame (a live stream never carries the head). */
+    public int internalGaps() { int first=firstSequence(); return first<0?0:received.length()-first-frames(); }
     public boolean contiguous() {
         return !received.isEmpty() && firstMissingSequence()==received.length();
     }

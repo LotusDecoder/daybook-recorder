@@ -28,6 +28,7 @@ import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.concurrent.*;
 import io.github.lotusdecoder.daybookrecorder.core.ConnectionHud;
+import io.github.lotusdecoder.daybookrecorder.core.LiveBackfill;
 import io.github.lotusdecoder.daybookrecorder.core.DeviceIdentity;
 import io.github.lotusdecoder.daybookrecorder.core.Protocol;
 import io.github.lotusdecoder.daybookrecorder.core.RecordingSizeUnit;
@@ -47,6 +48,7 @@ public final class MainActivity extends Activity {
     private final Handler main = new Handler(Looper.getMainLooper());
     private final ExecutorService io = Executors.newSingleThreadExecutor();
     private RecordingStore store;
+    private final Map<String, List<Long>> highlightCache = new HashMap<>();
     private DeviceFilesStore deviceFiles;
 
     // Top bar & Bottom 3-tab navigation
@@ -1164,8 +1166,13 @@ public final class MainActivity extends Activity {
                 heroStateTitle.setText("录音已暂停");
                 heroStateSub.setText("继续或结束录音后自动保存原音");
             } else if (RuntimeTelemetry.beanRecording) {
-                heroStateTitle.setText("正在录音 · 实时收音");
-                heroStateSub.setText("再次按下录音豆实体键结束录制");
+                if (RuntimeTelemetry.liveDeferredWeakSignal) {
+                    heroStateTitle.setText("正在录音 · 豆内独立存储");
+                    heroStateSub.setText("蓝牙信号偏弱，录音结束后自动补收");
+                } else {
+                    heroStateTitle.setText("正在录音 · 实时传输");
+                    heroStateSub.setText("边录边传至手机 · 再按实体键结束即刻上云");
+                }
             } else {
                 heroStateTitle.setText("已稳定连接");
                 heroStateSub.setText("按实体键开始录音 · 再按结束自动同步");
@@ -1691,6 +1698,8 @@ public final class MainActivity extends Activity {
             note = row.error;
         } else if (row.state.equals("WAITING") && !isActionableRow(row, deviceId, endpoint, snap)) {
             note = "录音豆内已无原件，无法续传；可点右侧删除此残片";
+        } else if (row.saved()) {
+            note = LiveBackfill.describeHighlights(highlightsFor(row));
         }
         if (note.isEmpty()) {
             h.noteText.setVisibility(View.GONE);
@@ -2504,6 +2513,12 @@ public final class MainActivity extends Activity {
         }
     }
 
+    private List<Long> highlightsFor(RecordingStore.Row row) {
+        String key = row.id + ":" + row.sha;
+        List<Long> cached = highlightCache.get(key);
+        if (cached == null) { cached = store.highlights(row.id); highlightCache.put(key, cached); }
+        return cached;
+    }
     private static long estimateExpectedDurationMs(RecordingStore.Row row) {
         if (row == null) return 0L;
         if (row.duration > 0L) return row.duration;

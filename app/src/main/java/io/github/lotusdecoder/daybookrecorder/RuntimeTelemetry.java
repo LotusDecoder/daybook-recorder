@@ -45,6 +45,7 @@ final class RuntimeTelemetry {
     static volatile int rssiDbm = Integer.MIN_VALUE;
     static volatile boolean beanRecording = false;
     static volatile boolean beanPaused = false;
+    static volatile boolean liveDeferredWeakSignal = false;
     static volatile boolean backgroundScanning = false;
     static volatile Transfer bleTransfer = null;
     static volatile Transfer httpUpload = null;
@@ -60,6 +61,7 @@ final class RuntimeTelemetry {
         rssiDbm = Integer.MIN_VALUE;
         beanRecording = false;
         beanPaused = false;
+        liveDeferredWeakSignal = false;
         backgroundScanning = false;
         bleTransfer = null;
         httpUpload = null;

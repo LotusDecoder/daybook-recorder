@@ -5,8 +5,20 @@ import java.util.Locale;
 /** Pure formatting and state-classification model for the graphic connection & transfer HUD. */
 public final class ConnectionHud {
     public enum Mode { CONNECTING, STABLE, DISCONNECTED, RECONNECTING }
+    /** Minimum BLE RSSI (dBm) considered stable enough to stream live Opus slices while recording. */
+    public static final int LIVE_SIGNAL_MIN_RSSI_DBM = -88;
+    /** Hysteresis threshold (dBm) required before promoting a weak-signal deferred take to live streaming. */
+    public static final int LIVE_SIGNAL_RECOVER_RSSI_DBM = -82;
 
     private ConnectionHud() {}
+
+    public static boolean isLiveSignalStable(int rssiDbm) {
+        return rssiDbm == Integer.MIN_VALUE || rssiDbm >= 0 || rssiDbm >= LIVE_SIGNAL_MIN_RSSI_DBM;
+    }
+
+    public static boolean canRecoverDeferredLive(int rssiDbm) {
+        return rssiDbm != Integer.MIN_VALUE && rssiDbm < 0 && rssiDbm >= LIVE_SIGNAL_RECOVER_RSSI_DBM;
+    }
 
     public static Mode classify(boolean serviceRunning, boolean bluetoothEnabled, boolean hasDevice,
                                 boolean bleReady, int reconnectCount, long lastStableDurationMs) {

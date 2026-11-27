@@ -2,10 +2,12 @@ package io.github.lotusdecoder.daybookrecorder;
 
 import android.content.Context;
 import org.json.JSONObject;
+import io.github.lotusdecoder.daybookrecorder.core.LiveBackfill;
 import java.io.*;
 import java.net.*;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
+import java.util.List;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -99,6 +101,8 @@ final class UploadQueue implements AutoCloseable {
             c.setRequestProperty("X-Duration-Ms",String.valueOf(row.duration));
             c.setRequestProperty("X-Source-File-Id",String.valueOf(row.fileId));
             c.setRequestProperty("X-Source-Device",row.device);
+            List<Long> highlights=store.highlights(row.id);
+            if(!highlights.isEmpty())c.setRequestProperty("X-Highlights-Ms",LiveBackfill.encodeHighlights(highlights));
             if(!target.token.isEmpty())c.setRequestProperty("Authorization","Bearer "+target.token);
             long totalLen=f.length(),sentLen=0L,startedNs=System.nanoTime();
             RuntimeTelemetry.httpUpload=new RuntimeTelemetry.Transfer(row.id,row.fileId,true,false,cleanup,0L,totalLen,row.duration,0.0);

@@ -224,4 +224,41 @@ public class RecordingTest {
         RecordingAssembler.clearResume(f);
         assertFalse(RecordingAssembler.attemptsFile(f).exists());
     }
+    @Test public void liveFastSettleAndPauseResetPreserveOfflineQuietGuarantees() {
+        TransferEnd end=new TransferEnd();
+        assertEquals(2000L,end.remainingMillis(100,TransferEnd.QUIET_MILLIS));
+        end.received(1000);
+        assertFalse(end.settledWithin(1299,TransferEnd.LIVE_EXACT_QUIET_MILLIS));
+        assertEquals(1L,end.remainingMillis(1299,TransferEnd.LIVE_EXACT_QUIET_MILLIS));
+        assertTrue(end.settledWithin(1300,TransferEnd.LIVE_EXACT_QUIET_MILLIS));
+        assertEquals(0L,end.remainingMillis(1400,TransferEnd.LIVE_EXACT_QUIET_MILLIS));
+        assertFalse(end.settled(2999));
+        assertTrue(end.settled(3000));
+        // Pause -> resume clears prior end marker so resumed live audio never premature-settles
+        end.reset();
+        assertFalse(end.received());
+        assertFalse(end.settledWithin(5000,TransferEnd.LIVE_EXACT_QUIET_MILLIS));
+    }
+    @Test public void liveZeroHeadCheckpointTransfersSeamlesslyToOfflineTailResume() throws Exception {
+        File f=temp.newFile();
+        byte[][] packets=new byte[120][160];
+        for(int i=0;i<120;i++) {
+            Arrays.fill(packets[i],(byte)7);
+            packets[i][0]=(byte)0xbc;
+            packets[i][159]=(byte)i;
+        }
+        try(RecordingAssembler live=new RecordingAssembler(f,false)) {
+            for(int i=0;i<118;i++)live.add(i,packets[i]);
+            live.checkpoint(0L);
+        }
+        try(RecordingAssembler offline=new RecordingAssembler(f,true)) {
+            assertEquals(118,offline.resumedFrames());
+            assertEquals(0L,offline.savedHeadSize());
+            assertEquals(13280L,offline.resumeRequestOffset());
+            assertFalse(offline.overlapVerified());
+            for(int i=80;i<120;i++)offline.add(i,packets[i]);
+            assertTrue(offline.overlapVerified());
+            assertTrue(offline.complete(120L*166L,RecordingSizeUnit.TRANSPORT_BYTES));
+        }
+    }
 }

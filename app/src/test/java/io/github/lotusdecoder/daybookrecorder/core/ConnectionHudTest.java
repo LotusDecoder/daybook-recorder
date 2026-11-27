@@ -51,4 +51,21 @@ public class ConnectionHudTest {
         }
         assertArrayEquals(bars, ConnectionHud.waveformProfile(1700000100L, 20), 0.0001f);
     }
+
+    @Test public void liveSignalGateAndRecoveryHysteresisBehaveStrictly() {
+        assertTrue(ConnectionHud.isLiveSignalStable(Integer.MIN_VALUE));
+        assertTrue(ConnectionHud.isLiveSignalStable(0));
+        assertTrue(ConnectionHud.isLiveSignalStable(-55));
+        assertTrue(ConnectionHud.isLiveSignalStable(-75));
+        assertTrue(ConnectionHud.isLiveSignalStable(-88));
+        assertFalse(ConnectionHud.isLiveSignalStable(-89));
+        assertFalse(ConnectionHud.isLiveSignalStable(-96));
+
+        assertFalse(ConnectionHud.canRecoverDeferredLive(Integer.MIN_VALUE));
+        assertFalse(ConnectionHud.canRecoverDeferredLive(0));
+        assertFalse(ConnectionHud.canRecoverDeferredLive(-89));
+        assertFalse(ConnectionHud.canRecoverDeferredLive(-83));
+        assertTrue(ConnectionHud.canRecoverDeferredLive(-82));
+        assertTrue(ConnectionHud.canRecoverDeferredLive(-64));
+    }
 }
